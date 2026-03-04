@@ -1,0 +1,106 @@
+version: '3.8'
+
+x-replica: &replica-base
+  build: .
+  networks:
+    - cluster
+  depends_on:
+    - redis
+  environment:
+    - PORT=8080
+    - MODE=${MODE:-gossip}
+    - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+    - REDIS_ADDR=redis:6379
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    hostname: redis
+    networks:
+      - cluster
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly no --save ""
+
+  replica-1:
+    <<: *replica-base
+    container_name: replica-1
+    hostname: replica-1
+    environment:
+      - REPLICA_ID=replica-1
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8081:8080"
+
+  replica-2:
+    <<: *replica-base
+    container_name: replica-2
+    hostname: replica-2
+    environment:
+      - REPLICA_ID=replica-2
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8082:8080"
+
+  replica-3:
+    <<: *replica-base
+    container_name: replica-3
+    hostname: replica-3
+    environment:
+      - REPLICA_ID=replica-3
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8083:8080"
+
+  replica-4:
+    <<: *replica-base
+    container_name: replica-4
+    hostname: replica-4
+    environment:
+      - REPLICA_ID=replica-4
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8084:8080"
+
+  replica-5:
+    <<: *replica-base
+    container_name: replica-5
+    hostname: replica-5
+    environment:
+      - REPLICA_ID=replica-5
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8085:8080"
+
+  replica-6:
+    <<: *replica-base
+    container_name: replica-6
+    hostname: replica-6
+    environment:
+      - REPLICA_ID=replica-6
+      - PORT=8080
+      - MODE=${MODE:-gossip}
+      - ALL_REPLICAS=replica-1,replica-2,replica-3,replica-4,replica-5,replica-6
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "8086:8080"
+
+networks:
+  cluster:
+    driver: bridge
