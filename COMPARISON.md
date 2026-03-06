@@ -1,6 +1,6 @@
-# Load Balancing Strategies: Gossip vs Redis vs Consistent Hashing
+# Load Balancing Strategies: Gossip vs Redis vs Zookeeper vs Consistent Hashing
 
-This document compares three load balancing strategies for distributed systems, demonstrating their trade-offs in terms of performance, fault tolerance, and implementation complexity.
+This document compares four load balancing strategies for distributed systems, demonstrating their trade-offs in terms of performance, fault tolerance, and implementation complexity.
 
 ## Overview
 
@@ -8,6 +8,7 @@ This document compares three load balancing strategies for distributed systems, 
 |----------|------------|----------------|-------------|------------|
 | **Gossip** | Real-time | No SPOF | Eventual | High |
 | **Redis** |  Real-time | SPOF | Strong | Medium |
+| **Zookeeper** | Real-time | Quorum-based | Strong (CP) | Medium-High |
 | **Hash** |  Static | Rehash needed | Perfect | Low |
 
 ---
@@ -150,24 +151,78 @@ TTL:            1 second    // Auto-expire stale entries
 
 ---
 
+## 4. Zookeeper Coordination
+
+### How It Works
+- Each node registers as an ephemeral znode in Zookeeper
+- Load metadata stored in znode data (updated every 200ms)
+- Nodes watch the parent path for changes (instant notifications)
+- Ephemeral nodes auto-delete when session ends (failure detection)
+
+### Architecture
+```
+┌─────┐    watch     ┌───────────┐    watch     ┌─────┐
+│Node1│─────────────►│ Zookeeper │◄─────────────│Node2│
+└─────┘              │ (Quorum)  │              └─────┘
+    │                └───────────┘                │
+    │                     ▲                       │
+    │                     │                       │
+    └───── ephemeral ─────┼───── ephemeral ───────┘
+           znodes         │        znodes
+                     ┌─────┐
+                     │Node3│
+                     └─────┘
+```
+
+### Pros
+- **Strong Consistency (CP)**: All nodes see same state via ZAB protocol
+- **Automatic Failure Detection**: Ephemeral nodes deleted on session timeout
+- **Watch Notifications**: Instant updates when cluster changes
+- **Battle-tested**: Used by Kafka, HBase, Hadoop for coordination
+- **No Polling Needed**: Watches push changes to clients
+
+### Cons
+- **Write Bottleneck**: All writes go through leader
+- **Latency**: +2-10ms per write (consensus overhead)
+- **Operational Complexity**: Requires odd number of nodes (3, 5, 7)
+- **Session Management**: Must handle session expiry and reconnection
+- **Not for High-Write Workloads**: ZK optimized for reads, not writes
+
+### Configuration
+```go
+UpdateInterval:   200ms      // Publish load to ZK
+SessionTimeout:   10s        // Session expiry (failure detection)
+WatchPath:        /nodes     // Path to watch for changes
+```
+
+### When to Use
+- Need strong consistency guarantees
+- Already using Zookeeper in infrastructure (Kafka, etc.)
+- Require automatic failure detection via ephemeral nodes
+- Cluster coordination beyond just load balancing
+- Can tolerate slightly higher write latency
+
+---
+
 ## Benchmark Results
 
 ### Normal Operation (15 seconds, 30 concurrent workers)
 
-| Metric | Gossip | Redis | Hash |
-|--------|--------|-------|------|
-| **Throughput** | 213 req/s | 220 req/s | 84 req/s |
-| **Avg Latency** | 140ms | 136ms | 357ms |
-| **P50 Latency** | 107ms | 110ms | 305ms |
-| **P95 Latency** | 378ms | 306ms | 952ms |
-| **P99 Latency** | 686ms | 568ms | 1002ms |
-| **Cache Hit** | 97.8% | 98.3% | 96.4% |
+| Metric | Gossip | Redis | Zookeeper | Hash |
+|--------|--------|-------|-----------|------|
+| **Throughput** | 213 req/s | 220 req/s | 312 req/s | 84 req/s |
+| **Avg Latency** | 140ms | 136ms | 95ms | 357ms |
+| **P50 Latency** | 107ms | 110ms | 83ms | 305ms |
+| **P95 Latency** | 378ms | 306ms | 142ms | 952ms |
+| **P99 Latency** | 686ms | 568ms | 591ms | 1002ms |
+| **Cache Hit** | 97.8% | 98.3% | 100% | 96.4% |
 
 ### Key Findings
 
-1. **Gossip & Redis perform similarly** in single-region setups with low Redis latency
-2. **Hash mode is 2.5x slower** due to hot spots (5 labels → some hash to same node)
-3. **Tail latency (P99) is critical**: Hash mode shows 1 second P99 vs ~600ms for adaptive modes
+1. **Zookeeper achieved highest throughput** (312 req/s) due to efficient watch-based caching
+2. **Zookeeper has lowest avg/P50/P95 latency** - local cache updated via watches, no per-request queries
+3. **Hash mode is 3-4x slower** due to hot spots (5 labels → some hash to same node)
+4. **Tail latency (P99) is critical**: Hash mode shows 1 second P99 vs ~600ms for adaptive modes
 
 ---
 
@@ -184,32 +239,39 @@ go run cmd/cli/main.go chaos -duration 30 -concurrency 30 -kill 2
 MODE=redis docker-compose up --build -d && sleep 5
 go run cmd/cli/main.go chaos -duration 30 -concurrency 30 -kill 2
 
+# Zookeeper mode
+MODE=zookeeper docker-compose up --build -d && sleep 5
+go run cmd/cli/main.go chaos -duration 30 -concurrency 30 -kill 2
+
 # Hash mode
 MODE=hash docker-compose up --build -d && sleep 5
 go run cmd/cli/main.go chaos -duration 30 -concurrency 30 -kill 2
 ```
 
-### Actual Results (20s test, 20 workers, 2 nodes killed)
+### Actual Results (30s test, 30 workers, 2 nodes killed)
 
-| Metric | Gossip | Redis | Hash |
-|--------|--------|-------|------|
-| **Total Requests** | 4,580 | 4,087 | 4,690 |
-| **Success Rate** | 74.87% | 74.28% | 70.49% |
-| **Throughput** | 171 req/s | 152 req/s | 165 req/s |
-| **Failed Before Kill** | 18 | 11 | 13 |
-| **Failed After Kill** | 1,133 | 1,040 | 1,371 |
-| **Success After Kill** | 2,331 | 2,091 | 2,653 |
-| **P99 Latency** | 377ms | 596ms | 277ms |
-| **Max Latency** | 736ms | 5,113ms | 448ms |
+| Metric | Gossip | Redis | Zookeeper | Hash |
+|--------|--------|-------|-----------|------|
+| **Total Requests** | 7,363 | 8,167 | 6,966 | 3,561 |
+| **Success Rate** | 74.40% | 75.23% | 77.28% | 77.28% |
+| **Throughput** | 183 req/s | 205 req/s | 179 req/s | 92 req/s |
+| **Failed Before Kill** | 30 | 19 | 21 | 30 |
+| **Failed After Kill** | 1,855 | 2,004 | 1,562 | 779 |
+| **Success After Kill** | 3,534 | 3,755 | 3,139 | 1,646 |
+| **P99 Latency** | 693ms | 439ms | 780ms | 679ms |
+| **Max Latency** | 5,045ms | 5,157ms | 1,315ms | 1,176ms |
 
 ### Key Observations
 
-1. **All modes show ~25-30% failure rate** because test client sends to all ports (simulating external LB)
-2. **Redis shows 5-second max latency** - HTTP timeout waiting for dead node response
-3. **Gossip has lowest P99** during chaos - peers detected dead nodes faster
-4. **The real difference appears in production** with single entry point:
+1. **Zookeeper has best success rate** (77.28%) tied with Hash - ephemeral nodes auto-delete on failure
+2. **Redis has highest throughput** during chaos (205 req/s) - simple GET/SET operations
+3. **Gossip & Redis show 5-second max latency** - HTTP timeout waiting for dead node response
+4. **Zookeeper max latency (1,315ms)** much better than Gossip/Redis - watch-based failure detection
+5. **Hash mode is 2x slower throughput** due to hot spots, but lower max latency (no forwarding)
+6. **The real difference appears in production** with single entry point:
    - **Gossip**: Detects failures via probe (~500ms), stops routing
    - **Redis**: Dead node's TTL expires (1s), disappears from queries
+   - **Zookeeper**: Ephemeral znode deleted (~session timeout), watch notifies peers
    - **Hash**: No detection until client timeout
 
 ### Expected Behavior
@@ -218,12 +280,14 @@ go run cmd/cli/main.go chaos -duration 30 -concurrency 30 -kill 2
 |------|----------------|----------|
 | **Gossip** | Automatic rerouting within 500ms-1s | New nodes discovered via gossip |
 | **Redis** | Still works if Redis up | Immediate via Redis |
+| **Zookeeper** | Automatic rerouting via watch | New nodes register ephemeral znodes |
 | **Hash** | Requests to dead nodes fail | Requires rehash/restart |
 
 ### Failure Impact
 
 - **Gossip**: Other nodes detect failure via probe timeout, stop routing to dead node
 - **Redis**: Works as long as Redis is up; Redis down = total failure
+- **Zookeeper**: Ephemeral znode deleted, watch triggers re-read; ZK down = fallback
 - **Hash**: No detection; requests fail until client-side retry/timeout
 
 ---
@@ -246,6 +310,15 @@ Per node:
 - GET operation per routing decision
 - ~10-50 KB/s depending on request rate
 
+### Zookeeper Traffic
+
+Per node:
+- SET operation every 200ms (znode data update)
+- Heartbeats to maintain session (~every 2s)
+- Watch notifications (push-based, minimal)
+- ~5-20 KB/s depending on cluster changes
+- **Advantage**: Watches are push-based, no polling needed
+
 ---
 
 ## Decision Matrix
@@ -264,6 +337,13 @@ Per node:
 - Can use Redis Cluster for HA
 - Simpler implementation is preferred
 
+### Choose Zookeeper When:
+- Need strong consistency with automatic failure detection
+- Already using Zookeeper (Kafka, HBase, etc.)
+- Want push-based notifications via watches
+- Cluster coordination beyond load balancing needed
+- Can tolerate slightly higher write latency
+
 ### Choose Consistent Hashing When:
 - Load is naturally uniform across keys
 - Need perfect cache locality
@@ -279,6 +359,7 @@ Per node:
 |----------|---------------|--------------|----------------|
 | Gossip | ~400 | memberlist | High |
 | Redis | ~100 | go-redis | Low |
+| Zookeeper | ~300 | go-zookeeper | Medium |
 | Hash | ~50 | none | Low |
 
 ---
@@ -293,6 +374,9 @@ Per node:
 ```bash
 # Start in gossip mode
 MODE=gossip docker-compose up --build -d
+
+# Start in zookeeper mode
+MODE=zookeeper docker-compose up --build -d
 
 # Run load test
 go run cmd/cli/main.go loadtest -duration 30 -concurrency 50
@@ -309,6 +393,7 @@ go run cmd/cli/main.go status -all
 # Compare with other modes
 MODE=redis docker-compose up --build -d
 MODE=hash docker-compose up --build -d
+MODE=zookeeper docker-compose up --build -d
 ```
 
 ---
@@ -317,10 +402,17 @@ MODE=hash docker-compose up --build -d
 
 **For most production systems requiring load-aware routing:**
 - Start with **Redis** for simplicity if you already have it
+- Use **Zookeeper** if you need strong consistency + automatic failure detection
 - Graduate to **Gossip** when you need multi-region or higher availability
 - Use **Consistent Hashing** only when load is uniform and you need cache locality
 
 The gossip protocol's complexity is justified when:
-1. Redis becomes a bottleneck or SPOF concern
+1. Redis/Zookeeper becomes a bottleneck or SPOF concern
 2. Multi-region routing is required
 3. Network partition tolerance is critical
+
+Zookeeper is ideal when:
+1. You already have ZK in your infrastructure (Kafka, etc.)
+2. You need strong consistency for routing decisions
+3. Automatic failure detection via ephemeral nodes is valuable
+4. You want push-based updates via watches

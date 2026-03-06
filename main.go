@@ -16,6 +16,7 @@ import (
 
 	"gossip_sharded_demo/gossip"
 	"gossip_sharded_demo/routing"
+	"gossip_sharded_demo/zookeeper"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -24,10 +25,12 @@ type Replica struct {
 	ID             string
 	Port           int
 	GossipMgr      *gossip.Manager
+	ZKMgr          *zookeeper.Manager
 	Router         *routing.Router
 	RedisClient    *redis.Client
 	RedisAddr      string
-	Mode           string // "gossip", "hash", or "redis"
+	ZKAddr         string
+	Mode           string // "gossip", "hash", "redis", or "zookeeper"
 	AllReplicas    []string
 	loadScore      int64 // Current concurrent requests
 	totalHandled   int64 // Total requests handled
@@ -66,13 +69,14 @@ type StatusResponse struct {
 	Peers          map[string]int64 `json:"peers,omitempty"`
 }
 
-func NewReplica(id string, port int, mode string, allReplicas []string, redisAddr string) *Replica {
+func NewReplica(id string, port int, mode string, allReplicas []string, redisAddr, zkAddr string) *Replica {
 	return &Replica{
 		ID:             id,
 		Port:           port,
 		Mode:           mode,
 		AllReplicas:    allReplicas,
 		RedisAddr:      redisAddr,
+		ZKAddr:         zkAddr,
 		slowdownFactor: 1,
 		labelCache:     make(map[string]bool),
 	}
@@ -113,6 +117,16 @@ func (r *Replica) Start() error {
 
 		// Publish load to Redis periodically
 		go r.publishLoadToRedis()
+	} else if r.Mode == "zookeeper" {
+		// Initialize Zookeeper manager
+		var err error
+		r.ZKMgr, err = zookeeper.NewManager(r.ID, r.ZKAddr)
+		if err != nil {
+			return fmt.Errorf("failed to start Zookeeper: %v", err)
+		}
+
+		// Broadcast load periodically
+		go r.broadcastLoadZK()
 	}
 
 	// Simulate variable node load (some nodes become slow randomly)
@@ -152,6 +166,18 @@ func (r *Replica) broadcastLoad() {
 			r.GossipMgr.UpdateLoad(atomic.LoadInt64(&r.loadScore))
 			// Also broadcast cached labels
 			r.GossipMgr.UpdateCachedLabels(r.getCachedLabels())
+		}
+	}
+}
+
+// broadcastLoadZK publishes this node's load to Zookeeper
+func (r *Replica) broadcastLoadZK() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	for range ticker.C {
+		if r.ZKMgr != nil {
+			r.ZKMgr.UpdateLoad(atomic.LoadInt64(&r.loadScore))
+			// Also broadcast cached labels
+			r.ZKMgr.UpdateCachedLabels(r.getCachedLabels())
 		}
 	}
 }
@@ -466,6 +492,70 @@ func (r *Replica) handleRequest(w http.ResponseWriter, req *http.Request) {
 				routingReason = fmt.Sprintf("redis_lowest_load=%d@%s", lowestLoad, targetReplica)
 			}
 		}
+	} else if r.Mode == "zookeeper" && r.ZKMgr != nil {
+		// Zookeeper mode - fetch loads from ZK (strong consistency via watches)
+		clusterLoads = r.ZKMgr.GetAllNodes()
+		response.ClusterLoads = clusterLoads
+
+		if len(clusterLoads) == 0 {
+			// No peers visible yet, handle locally
+			targetReplica = r.ID
+			routingReason = "zk_no_peers_fallback"
+		} else if label != "" {
+			// Get nodes that have this label cached
+			nodesWithLabel := r.ZKMgr.GetNodesWithLabel(label)
+
+			if len(nodesWithLabel) > 0 {
+				// Strategy: Find node with label AND lowest load
+				lowestCachedLoad := int64(999999)
+				var bestCachedNode string
+				for id, load := range nodesWithLabel {
+					if load < lowestCachedLoad {
+						lowestCachedLoad = load
+						bestCachedNode = id
+					}
+				}
+
+				// Also find the overall lowest loaded node
+				lowestOverallLoad := int64(999999)
+				var lowestOverallNode string
+				for id, load := range clusterLoads {
+					if load < lowestOverallLoad {
+						lowestOverallLoad = load
+						lowestOverallNode = id
+					}
+				}
+
+				// Decision: Use cached node unless it's significantly more loaded (>3 more)
+				if lowestCachedLoad <= lowestOverallLoad+3 {
+					targetReplica = bestCachedNode
+					routingReason = fmt.Sprintf("zk_cached_label=%s,load=%d@%s", label, lowestCachedLoad, bestCachedNode)
+				} else {
+					targetReplica = lowestOverallNode
+					routingReason = fmt.Sprintf("zk_uncached_lighter,load=%d@%s(cached=%d@%s)", lowestOverallLoad, lowestOverallNode, lowestCachedLoad, bestCachedNode)
+				}
+			} else {
+				// No node has this label cached - send to lowest loaded node to warm it up
+				lowestLoad := int64(999999)
+				for id, load := range clusterLoads {
+					if load < lowestLoad {
+						lowestLoad = load
+						targetReplica = id
+					}
+				}
+				routingReason = fmt.Sprintf("zk_no_cache_for=%s,warmup@%s,load=%d", label, targetReplica, lowestLoad)
+			}
+		} else {
+			// No label - just use lowest load
+			lowestLoad := int64(999999)
+			for id, load := range clusterLoads {
+				if load < lowestLoad {
+					lowestLoad = load
+					targetReplica = id
+				}
+			}
+			routingReason = fmt.Sprintf("zk_lowest_load=%d@%s", lowestLoad, targetReplica)
+		}
 	} else {
 		// Consistent hash mode - hash key (or label if present) to fixed node
 		hashKey := key
@@ -576,6 +666,9 @@ func (r *Replica) handleStatus(w http.ResponseWriter, req *http.Request) {
 	if r.Mode == "gossip" && r.GossipMgr != nil {
 		response.Peers = r.GossipMgr.GetPeers()
 		response.ClusterSize = r.GossipMgr.NumMembers()
+	} else if r.Mode == "zookeeper" && r.ZKMgr != nil {
+		response.Peers = r.ZKMgr.GetPeers()
+		response.ClusterSize = r.ZKMgr.NumMembers()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -592,6 +685,7 @@ func (r *Replica) handleMetrics(w http.ResponseWriter, req *http.Request) {
 		ID           string                  `json:"id"`
 		Mode         string                  `json:"mode"`
 		GossipMetrics *gossip.GossipMetrics  `json:"gossip_metrics,omitempty"`
+		ZKMetrics    *zookeeper.ZKMetrics    `json:"zk_metrics,omitempty"`
 	}
 
 	response := MetricsResponse{
@@ -602,6 +696,9 @@ func (r *Replica) handleMetrics(w http.ResponseWriter, req *http.Request) {
 	if r.Mode == "gossip" && r.GossipMgr != nil {
 		metrics := r.GossipMgr.GetMetrics()
 		response.GossipMetrics = &metrics
+	} else if r.Mode == "zookeeper" && r.ZKMgr != nil {
+		metrics := r.ZKMgr.GetMetrics()
+		response.ZKMetrics = &metrics
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -630,6 +727,11 @@ func main() {
 		redisAddr = "redis:6379"
 	}
 
+	zkAddr := os.Getenv("ZK_ADDR")
+	if zkAddr == "" {
+		zkAddr = "zookeeper:2181"
+	}
+
 	replicasStr := os.Getenv("ALL_REPLICAS")
 	var allReplicas []string
 	if replicasStr != "" {
@@ -640,7 +742,7 @@ func main() {
 
 	rand.Seed(time.Now().UnixNano())
 
-	replica := NewReplica(id, port, mode, allReplicas, redisAddr)
+	replica := NewReplica(id, port, mode, allReplicas, redisAddr, zkAddr)
 	if err := replica.Start(); err != nil {
 		log.Fatalf("Failed to start replica: %v", err)
 	}

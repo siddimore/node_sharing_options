@@ -1,15 +1,16 @@
 # Gossip Sharding Demo
 
-A distributed systems demonstration comparing three load balancing strategies: **Gossip Protocol**, **Redis Central Registry**, and **Consistent Hashing**.
+A distributed systems demonstration comparing four load balancing strategies: **Gossip Protocol**, **Redis Central Registry**, **Zookeeper Coordination**, and **Consistent Hashing**.
 
 ## Overview
 
-This project implements a 6-node cluster where each node can route requests based on different load balancing strategies. It demonstrates the trade-offs between decentralized (gossip), centralized (Redis), and deterministic (hash) approaches.
+This project implements a 6-node cluster where each node can route requests based on different load balancing strategies. It demonstrates the trade-offs between decentralized (gossip), centralized (Redis/Zookeeper), and deterministic (hash) approaches.
 
 | Strategy | Load Aware | Fault Tolerant | Consistency | Complexity |
 |----------|------------|----------------|-------------|------------|
 | **Gossip** | Real-time | No SPOF | Eventual | High |
 | **Redis** | Real-time | SPOF | Strong | Medium |
+| **Zookeeper** | Real-time | Quorum-based | Strong (CP) | Medium-High |
 | **Hash** | Static | Rehash needed | Perfect | Low |
 
 ## Architecture
@@ -25,15 +26,15 @@ This project implements a 6-node cluster where each node can route requests base
 │       │            │            │                            │
 │       └────────────┼────────────┘                            │
 │                    │                                         │
-│  ┌─────────┐  ┌────┴────┐  ┌─────────┐                      │
-│  │Replica-4│  │  Redis  │  │Replica-6│                      │
-│  │  :8084  │  │  :6379  │  │  :8086  │                      │
-│  └─────────┘  └─────────┘  └─────────┘                      │
-│                    │                                         │
-│              ┌─────────┐                                     │
-│              │Replica-5│                                     │
-│              │  :8085  │                                     │
-│              └─────────┘                                     │
+│  ┌─────────┐  ┌────┴────┐  ┌───────────┐                  │
+│  │Replica-4│  │  Redis  │  │ Zookeeper │                  │
+│  │  :8084  │  │  :6379  │  │   :2181   │                  │
+│  └─────────┘  └─────────┘  └───────────┘                  │
+│       │            │                                         │
+│  ┌────┴────┐  ┌────┴────┐                                  │
+│  │Replica-5│  │Replica-6│                                  │
+│  │  :8085  │  │  :8086  │                                  │
+│  └─────────┘  └─────────┘                                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,7 +101,26 @@ MODE=redis docker-compose up --build -d
 - +1-5ms latency per routing decision
 - Redis becomes bottleneck at scale
 
-### 3. Consistent Hashing (`MODE=hash`)
+### 3. Zookeeper Coordination (`MODE=zookeeper`)
+
+Nodes register as ephemeral znodes with load metadata. Watches provide instant notifications when cluster changes.
+
+```bash
+MODE=zookeeper docker-compose up --build -d
+```
+
+**Pros:**
+- Strong consistency via ZAB protocol
+- Automatic failure detection (ephemeral nodes)
+- Push-based updates via watches
+- Battle-tested (Kafka, HBase, Hadoop)
+
+**Cons:**
+- Write bottleneck (all writes go through leader)
+- +2-10ms latency for consensus
+- Operational complexity (requires quorum)
+
+### 4. Consistent Hashing (`MODE=hash`)
 
 Deterministic routing based on hash function. No inter-node communication.
 
@@ -142,7 +162,7 @@ go run cmd/cli/main.go metrics
 # Check status of all replicas
 go run cmd/cli/main.go status -all
 
-# Compare all three modes
+# Compare all four modes
 go run cmd/cli/main.go compare
 ```
 
@@ -150,20 +170,21 @@ go run cmd/cli/main.go compare
 
 ### Normal Operation (15 seconds, 30 concurrent workers)
 
-| Metric | Gossip | Redis | Hash |
-|--------|--------|-------|------|
-| **Throughput** | 213 req/s | 220 req/s | 84 req/s |
-| **Avg Latency** | 140ms | 136ms | 357ms |
-| **P95 Latency** | 378ms | 306ms | 952ms |
-| **P99 Latency** | 686ms | 568ms | 1002ms |
+| Metric | Gossip | Redis | Zookeeper | Hash |
+|--------|--------|-------|-----------|------|
+| **Throughput** | 213 req/s | 220 req/s | 312 req/s | 84 req/s |
+| **Avg Latency** | 140ms | 136ms | 95ms | 357ms |
+| **P95 Latency** | 378ms | 306ms | 142ms | 952ms |
+| **P99 Latency** | 686ms | 568ms | 591ms | 1002ms |
 
-### Chaos Test (20s, 2 nodes killed)
+### Chaos Test (30s, 30 workers, 2 nodes killed)
 
-| Metric | Gossip | Redis | Hash |
-|--------|--------|-------|------|
-| **Success Rate** | 74.87% | 74.28% | 70.49% |
-| **P99 Latency** | 377ms | 596ms | 277ms |
-| **Max Latency** | 736ms | 5,113ms | 448ms |
+| Metric | Gossip | Redis | Zookeeper | Hash |
+|--------|--------|-------|-----------|------|
+| **Success Rate** | 74.40% | 75.23% | 77.28% | 77.28% |
+| **Throughput** | 183 req/s | 205 req/s | 179 req/s | 92 req/s |
+| **P99 Latency** | 693ms | 439ms | 780ms | 679ms |
+| **Max Latency** | 5,045ms | 5,157ms | 1,315ms | 1,176ms |
 
 See [COMPARISON.md](COMPARISON.md) for detailed analysis.
 
@@ -173,6 +194,8 @@ See [COMPARISON.md](COMPARISON.md) for detailed analysis.
 ├── main.go              # Replica server implementation
 ├── gossip/
 │   └── manager.go       # Gossip protocol manager (memberlist)
+├── zookeeper/
+│   └── manager.go       # Zookeeper coordination manager
 ├── routing/
 │   └── router.go        # Consistent hash router
 ├── cmd/cli/
@@ -188,11 +211,12 @@ Environment variables for each replica:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MODE` | Load balancing mode: `gossip`, `redis`, `hash` | `gossip` |
+| `MODE` | Load balancing mode: `gossip`, `redis`, `zookeeper`, `hash` | `gossip` |
 | `REPLICA_ID` | Unique identifier for this replica | - |
 | `PORT` | HTTP server port | `8080` |
 | `ALL_REPLICAS` | Comma-separated list of all replicas | - |
 | `REDIS_ADDR` | Redis server address | `redis:6379` |
+| `ZK_ADDR` | Zookeeper server address | `zookeeper:2181` |
 
 ## API Endpoints
 
@@ -213,6 +237,7 @@ Each replica exposes:
 2. Replica determines target node based on mode:
    - **Gossip**: Check local peer state, route to lowest load
    - **Redis**: Query Redis for cluster loads, route to lowest
+   - **Zookeeper**: Read peer znodes (cached via watches), route to lowest load
    - **Hash**: Compute hash of key, deterministically select node
 3. If target is self, handle locally; otherwise forward
 4. Response includes routing metadata for analysis
@@ -229,6 +254,8 @@ Requests can include a `label` (e.g., "payments", "auth"). Nodes cache labels th
 | High availability required | Gossip |
 | Already using Redis | Redis |
 | Single region, simple setup | Redis |
+| Need strong consistency + auto failure detection | Zookeeper |
+| Already using Kafka/ZK infrastructure | Zookeeper |
 | Uniform load distribution | Hash |
 | Cache layer (memcached-style) | Hash |
 
